@@ -58,13 +58,20 @@ MODEL_FILE = "Qwen3-0.6B-grpo-ckpt700-q8_0.gguf"
 THINK_PREFILL = "<think>\n\n</think>\n\n"
 
 
+def _discover_model_files(model_dir: str) -> list[str]:
+    try:
+        return sorted(name for name in os.listdir(model_dir) if name.lower().endswith(".gguf"))
+    except OSError:
+        return []
+
+
 def _strip_thinking(text: str) -> str:
     candidate = text
     if candidate.startswith(THINK_PREFILL):
         candidate = candidate[len(THINK_PREFILL) :]
     candidate = re.sub(r"<think>.*?</think>\s*", "", candidate, flags=re.DOTALL)
     candidate = re.sub(r"^</think>\s*", "", candidate)
-    candidate = re.sub(r"^<think>.*$", "", candidate, flags=re.DOTALL)
+    candidate = re.sub(r"^<think>\s*", "", candidate)
     return candidate.strip()
 
 
@@ -201,11 +208,16 @@ class Qwen3LlamaCppModel(LLMModel):
         self.n_gpu_layers = _int_setting(settings, "n_gpu_layers", -1)
         self.main_gpu = _int_setting(settings, "main_gpu", 0)
         self.device = str(settings.get("device", "auto"))
+        self.model_file = os.path.basename(str(settings.get("model_file", MODEL_FILE)))
         self.vulkan_visible_devices = str(settings.get("vulkan_visible_devices", "")).strip()
         self.verbose = _bool_setting(settings, "verbose", False)
 
     def _model_path(self) -> str:
-        path = os.path.join(self.model_dir, MODEL_FILE)
+        path = os.path.join(self.model_dir, self.model_file)
+        if not os.path.exists(path):
+            model_files = _discover_model_files(self.model_dir)
+            if len(model_files) == 1:
+                path = os.path.join(self.model_dir, model_files[0])
         if not os.path.exists(path):
             raise FileNotFoundError(f"Model file not found: {path}")
         return path
@@ -307,7 +319,7 @@ class Qwen3LlamaCppModel(LLMModel):
         candidate = _strip_thinking(text)
         calls: list[Any] = []
 
-        for match in re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", candidate, re.DOTALL):
+        for match in re.finditer(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", candidate, re.DOTALL):
             payload_text = _extract_json_object(match.group(1))
             if not payload_text:
                 continue
@@ -324,7 +336,7 @@ class Qwen3LlamaCppModel(LLMModel):
                 calls.append(self._tool_call(name, arguments, len(calls)))
 
         for match in re.finditer(
-            r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)\s*</function>\s*</tool_call>",
+            r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)\s*</function>\s*(?:</tool_call>|$)",
             candidate,
             re.DOTALL,
         ):
@@ -386,7 +398,7 @@ class Qwen3LlamaCppModel(LLMModel):
         llm = self._get_model()
 
         params: dict[str, Any] = {
-            "messages": messages if tools else self._messages_with_think_prefill(messages),
+            "messages": self._messages_with_think_prefill(messages),
             "temperature": self.temperature,
             "top_p": self.top_p,
             "repeat_penalty": self.repeat_penalty,
@@ -429,79 +441,101 @@ class Qwen3LlamaCppPlugin(PluginBase):
     def __init__(self, plugin_manifest: PluginManifest):
         super().__init__(plugin_manifest)
 
+        plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        model_files = _discover_model_files(os.path.join(plugin_dir, "model"))
         device_options = _device_select_options()
+        runtime_fields: list[Any] = []
+        if len(model_files) > 1:
+            runtime_fields.append(
+                SelectSetting(
+                    key="model_file",
+                    label="Model file",
+                    type="select",
+                    readonly=False,
+                    placeholder=None,
+                    default_value=model_files[0],
+                    select_options=[
+                        SelectOption(key=model_file, label=model_file, value=model_file, disabled=False)
+                        for model_file in model_files
+                    ],
+                    multi_select=False,
+                )
+            )
+        runtime_fields.extend(
+            [
+                SelectSetting(
+                    key="device",
+                    label="Device",
+                    type="select",
+                    readonly=False,
+                    placeholder=None,
+                    default_value="auto",
+                    select_options=device_options,
+                    multi_select=False,
+                ),
+                TextSetting(
+                    key="vulkan_visible_devices",
+                    label="Vulkan visible devices",
+                    type="text",
+                    readonly=False,
+                    placeholder="0 or 1 or 0,1",
+                    default_value="",
+                    max_length=64,
+                    min_length=None,
+                    hidden=False,
+                ),
+                NumericalSetting(
+                    key="n_ctx",
+                    label="Context size",
+                    type="number",
+                    readonly=False,
+                    placeholder=None,
+                    default_value=16384,
+                    min_value=1024,
+                    max_value=40960,
+                    step=1024,
+                ),
+                NumericalSetting(
+                    key="n_gpu_layers",
+                    label="GPU layers (-1 = all)",
+                    type="number",
+                    readonly=False,
+                    placeholder=None,
+                    default_value=-1,
+                    min_value=-1,
+                    max_value=200,
+                    step=1,
+                ),
+                NumericalSetting(
+                    key="main_gpu",
+                    label="Main GPU index",
+                    type="number",
+                    readonly=False,
+                    placeholder=None,
+                    default_value=0,
+                    min_value=0,
+                    max_value=16,
+                    step=1,
+                ),
+                NumericalSetting(
+                    key="n_threads",
+                    label="CPU threads",
+                    type="number",
+                    readonly=False,
+                    placeholder=None,
+                    default_value=max(1, (os.cpu_count() or 4) // 2),
+                    min_value=1,
+                    max_value=128,
+                    step=1,
+                ),
+            ]
+        )
 
         provider_settings: list[SettingsGrid] = [
             SettingsGrid(
                 key="runtime",
                 label="Runtime",
-                fields=[
-                    SelectSetting(
-                        key="device",
-                        label="Device",
-                        type="select",
-                        readonly=False,
-                        placeholder=None,
-                        default_value="auto",
-                        select_options=device_options,
-                        multi_select=False,
-                    ),
-                    TextSetting(
-                        key="vulkan_visible_devices",
-                        label="Vulkan visible devices",
-                        type="text",
-                        readonly=False,
-                        placeholder="0 or 1 or 0,1",
-                        default_value="",
-                        max_length=64,
-                        min_length=None,
-                        hidden=False,
-                    ),
-                    NumericalSetting(
-                        key="n_ctx",
-                        label="Context size",
-                        type="number",
-                        readonly=False,
-                        placeholder=None,
-                        default_value=16384,
-                        min_value=1024,
-                        max_value=40960,
-                        step=1024,
-                    ),
-                    NumericalSetting(
-                        key="n_gpu_layers",
-                        label="GPU layers (-1 = all)",
-                        type="number",
-                        readonly=False,
-                        placeholder=None,
-                        default_value=-1,
-                        min_value=-1,
-                        max_value=200,
-                        step=1,
-                    ),
-                    NumericalSetting(
-                        key="main_gpu",
-                        label="Main GPU index",
-                        type="number",
-                        readonly=False,
-                        placeholder=None,
-                        default_value=0,
-                        min_value=0,
-                        max_value=16,
-                        step=1,
-                    ),
-                    NumericalSetting(
-                        key="n_threads",
-                        label="CPU threads",
-                        type="number",
-                        readonly=False,
-                        placeholder=None,
-                        default_value=max(1, (os.cpu_count() or 4) // 2),
-                        min_value=1,
-                        max_value=128,
-                        step=1,
-                    ),
-                ],
+                fields=runtime_fields,
             ),
             SettingsGrid(
                 key="generation",
