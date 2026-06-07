@@ -1,7 +1,7 @@
 {
     "guid": "cf751883-280e-40b7-8d8a-d6ee52c0cac6",
     "name": "COVAS:NEXT Plugin Qwen3 llama.cpp",
-    "version": "0.0.3",
+    "version": "0.0.4",
     "author": "lucaelin",
     "repository": "https://github.com/COVAS-Labs/plugin-qwen3-llamacpp",
     "description": "Run Qwen3 0.6B locally using llama.cpp with Vulkan support",

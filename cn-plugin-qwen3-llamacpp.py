@@ -386,7 +386,7 @@ class Qwen3LlamaCppModel(LLMModel):
         llm = self._get_model()
 
         params: dict[str, Any] = {
-            "messages": self._messages_with_think_prefill(messages),
+            "messages": messages if tools else self._messages_with_think_prefill(messages),
             "temperature": self.temperature,
             "top_p": self.top_p,
             "repeat_penalty": self.repeat_penalty,
