@@ -5,10 +5,40 @@ Qwen3 llama.cpp plugin for COVAS:NEXT.
 from __future__ import annotations
 
 import os
+import html
+import json
+import re
 from time import time
 from typing import Any, List, Optional, override
 
-from lib.Logger import ModelUsageStats, log
+try:
+    from lib.Logger import ModelUsageStats, log
+except ImportError:
+    from lib.Logger import log
+
+    class ModelUsageStats:  # type: ignore[no-redef]
+        def __init__(
+            self,
+            input_tokens: int | None = None,
+            output_tokens: int | None = None,
+            total_tokens: int | None = None,
+            cached_tokens: int | None = None,
+            reasoning_tokens: int | None = None,
+            provider: str | None = None,
+            model_name: str | None = None,
+            response_ms: float | None = None,
+            output_chars: int | None = None,
+        ):
+            self.input_tokens = input_tokens
+            self.output_tokens = output_tokens
+            self.total_tokens = total_tokens
+            self.cached_tokens = cached_tokens
+            self.reasoning_tokens = reasoning_tokens
+            self.provider = provider
+            self.model_name = model_name
+            self.response_ms = response_ms
+            self.output_chars = output_chars
+
 from lib.Models import LLMError, LLMModel
 from lib.PluginBase import PluginBase, PluginManifest
 from lib.PluginSettingDefinitions import (
@@ -19,11 +49,53 @@ from lib.PluginSettingDefinitions import (
     SelectOption,
     SelectSetting,
     SettingsGrid,
+    TextSetting,
     ToggleSetting,
 )
 
 
 MODEL_FILE = "Qwen3-0.6B-grpo-ckpt700-q8_0.gguf"
+THINK_PREFILL = "<think>\n\n</think>\n\n"
+
+
+def _strip_thinking(text: str) -> str:
+    candidate = text
+    if candidate.startswith(THINK_PREFILL):
+        candidate = candidate[len(THINK_PREFILL) :]
+    candidate = re.sub(r"<think>.*?</think>\s*", "", candidate, flags=re.DOTALL)
+    candidate = re.sub(r"^</think>\s*", "", candidate)
+    candidate = re.sub(r"^<think>.*$", "", candidate, flags=re.DOTALL)
+    return candidate.strip()
+
+
+def _extract_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
 
 
 def _decode_vk_string(value: Any) -> str:
@@ -192,14 +264,29 @@ class Qwen3LlamaCppModel(LLMModel):
             output_chars=len(output_text) if output_text is not None else None,
         )
 
-    def _convert_tool_calls(self, raw_tool_calls: Any) -> list[Any] | None:
-        if not raw_tool_calls:
-            return None
-
+    def _tool_call(self, name: str, arguments: Any, index: int, call_id: str | None = None) -> Any:
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments if isinstance(arguments, dict) else {}, ensure_ascii=False)
         try:
             from openai.types.chat import ChatCompletionMessageFunctionToolCall
         except Exception:
-            return raw_tool_calls if isinstance(raw_tool_calls, list) else None
+            return {
+                "id": call_id or f"call_{index}",
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+
+        return ChatCompletionMessageFunctionToolCall.model_validate(
+            {
+                "id": call_id or f"call_{index}",
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+        )
+
+    def _convert_tool_calls(self, raw_tool_calls: Any) -> list[Any] | None:
+        if not raw_tool_calls:
+            return None
 
         converted = []
         for index, tool_call in enumerate(raw_tool_calls):
@@ -209,18 +296,85 @@ class Qwen3LlamaCppModel(LLMModel):
 
             function = tool_call.get("function") or {}
             converted.append(
-                ChatCompletionMessageFunctionToolCall.model_validate(
-                    {
-                        "id": tool_call.get("id") or f"call_{index}",
-                        "type": "function",
-                        "function": {
-                            "name": function.get("name", ""),
-                            "arguments": function.get("arguments") or "{}",
-                        },
-                    }
-                )
+                self._tool_call(function.get("name", ""), function.get("arguments") or {}, index, tool_call.get("id"))
             )
         return converted or None
+
+    def _parse_tool_calls_from_text(self, text: str | None) -> list[Any] | None:
+        if not text:
+            return None
+
+        candidate = _strip_thinking(text)
+        calls: list[Any] = []
+
+        for match in re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", candidate, re.DOTALL):
+            payload_text = _extract_json_object(match.group(1))
+            if not payload_text:
+                continue
+            try:
+                payload = json.loads(payload_text)
+            except json.JSONDecodeError:
+                continue
+
+            name = payload.get("name") or payload.get("function", {}).get("name")
+            arguments = payload.get("arguments")
+            if arguments is None:
+                arguments = payload.get("function", {}).get("arguments", {})
+            if isinstance(name, str) and name:
+                calls.append(self._tool_call(name, arguments, len(calls)))
+
+        for match in re.finditer(
+            r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)\s*</function>\s*</tool_call>",
+            candidate,
+            re.DOTALL,
+        ):
+            name = match.group(1).strip()
+            body = match.group(2)
+            arguments: dict[str, Any] = {}
+            for param_match in re.finditer(r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>", body, re.DOTALL):
+                param_name = param_match.group(1).strip()
+                param_value_raw = html.unescape(param_match.group(2).strip())
+                try:
+                    param_value = json.loads(param_value_raw)
+                except json.JSONDecodeError:
+                    param_value = param_value_raw
+                if param_name:
+                    arguments[param_name] = param_value
+            if name:
+                calls.append(self._tool_call(name, arguments, len(calls)))
+
+        if calls:
+            return calls
+
+        payload_text = _extract_json_object(candidate)
+        if not payload_text:
+            return None
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            return None
+
+        raw_calls = payload.get("tool_calls") if isinstance(payload, dict) else None
+        if isinstance(raw_calls, list):
+            return self._convert_tool_calls(raw_calls)
+
+        if isinstance(payload, dict):
+            name = payload.get("name") or payload.get("function", {}).get("name")
+            arguments = payload.get("arguments")
+            if arguments is None:
+                arguments = payload.get("function", {}).get("arguments", {})
+            if isinstance(name, str) and name:
+                return [self._tool_call(name, arguments, 0)]
+
+        return None
+
+    def _messages_with_think_prefill(self, messages: List[dict]) -> list[dict[str, Any]]:
+        prepared = [dict(message) for message in messages]
+        if prepared and prepared[-1].get("role") == "assistant":
+            prepared[-1]["content"] = f"{prepared[-1].get('content') or ''}{THINK_PREFILL}"
+        else:
+            prepared.append({"role": "assistant", "content": THINK_PREFILL})
+        return prepared
 
     def generate(
         self,
@@ -232,7 +386,7 @@ class Qwen3LlamaCppModel(LLMModel):
         llm = self._get_model()
 
         params: dict[str, Any] = {
-            "messages": messages,
+            "messages": self._messages_with_think_prefill(messages),
             "temperature": self.temperature,
             "top_p": self.top_p,
             "repeat_penalty": self.repeat_penalty,
@@ -255,6 +409,15 @@ class Qwen3LlamaCppModel(LLMModel):
         message = choices[0].get("message") or {}
         response_text = message.get("content") or None
         response_actions = self._convert_tool_calls(message.get("tool_calls"))
+
+        if response_actions is None:
+            response_actions = self._parse_tool_calls_from_text(response_text)
+            if response_actions is not None:
+                response_text = None
+
+        if response_text is not None:
+            response_text = _strip_thinking(response_text) or None
+
         usage = self._usage(started_at, response, response_text)
 
         if response_text is None and response_actions is None:
