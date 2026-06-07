@@ -21,7 +21,7 @@ jobs:
       - name: Install Vulkan build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends glslc libvulkan-dev vulkan-headers
+          sudo apt-get install -y --no-install-recommends glslc libvulkan-dev
       - name: Download model
         run: |
           pip install huggingface_hub
@@ -50,7 +50,13 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install Vulkan SDK
-        run: choco install vulkan-sdk -y
+        run: |
+          choco install vulkan-sdk -y
+          $sdk = Get-ChildItem "C:\VulkanSDK" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $sdk) { throw "Vulkan SDK install directory not found" }
+          "VULKAN_SDK=$($sdk.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$($sdk.FullName)\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+        shell: pwsh
       - name: Download model
         run: |
           pip install huggingface_hub
